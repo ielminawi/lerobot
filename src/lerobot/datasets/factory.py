@@ -142,25 +142,40 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         # that the policy's input_features include.
         cam_keys = list(dataset.meta.camera_keys)
         image_key = cam_keys[0] if cam_keys else "observation.image"
-        # Peek at one robot sample to learn the target image size — celebrity
-        # images must be resized to match, otherwise the default_collate stacks
-        # tensors of different (H, W) and crashes.
-        try:
-            sample_img = dataset[0][image_key]
-            # tensor shape can be (C, H, W) or (T, C, H, W) for delta-timestamp queries.
-            if sample_img.ndim == 4:
-                _, _, H, W = sample_img.shape
-            else:
-                _, H, W = sample_img.shape
-            robot_image_size = (int(H), int(W))
-        except Exception:
-            robot_image_size = None
+        # Peek at one robot sample to learn the exact shapes the dataloader's
+        # default_collate will demand. Celebrity placeholders must match these
+        # or torch.stack crashes on mismatched sizes.
+        sample = dataset[0]
+        sample_img = sample[image_key]
+        # image tensor shape can be (C, H, W) or (T, C, H, W).
+        if sample_img.ndim == 4:
+            _, _, H, W = sample_img.shape
+        else:
+            _, H, W = sample_img.shape
+        robot_image_size = (int(H), int(W))
+
+        # Action shape: typically (chunk_size, action_dim). Use whatever the
+        # robot dataset emits raw — the model pads to max_action_dim internally.
+        sample_action = sample.get("action")
+        if sample_action is not None and sample_action.ndim == 2:
+            chunk_size, action_dim = sample_action.shape
+        else:
+            chunk_size = getattr(cfg.policy, "chunk_size", 50)
+            action_dim = getattr(cfg.policy, "max_action_dim", 32)
+
+        # State shape: (state_dim,) — also pulled from the actual sample.
+        sample_state = sample.get("observation.state")
+        if sample_state is not None and sample_state.ndim == 1:
+            state_dim = int(sample_state.shape[0])
+        else:
+            state_dim = getattr(cfg.policy, "max_state_dim", 32)
+
         celeb_ds = CelebrityIdentificationDataset(
             dataset_name=celeb_name,
             streaming=False,
-            chunk_size=getattr(cfg.policy, "chunk_size", 50),
-            action_dim=getattr(cfg.policy, "max_action_dim", 32),
-            state_dim=getattr(cfg.policy, "max_state_dim", 32),
+            chunk_size=int(chunk_size),
+            action_dim=int(action_dim),
+            state_dim=int(state_dim),
             image_camera_key=image_key,
             target_image_size=robot_image_size,
             all_camera_keys=cam_keys if cam_keys else None,
