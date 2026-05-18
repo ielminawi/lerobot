@@ -47,15 +47,21 @@ def _name_from_label(features, label: Any) -> str:
     return str(label)
 
 
-def _pil_to_tensor(image, channels: int = 3) -> torch.Tensor:
-    """Convert a PIL image to a (C, H, W) float tensor in [0, 1]."""
+def _pil_to_tensor(
+    image, target_size: tuple[int, int] | None = None
+) -> torch.Tensor:
+    """Convert a PIL image to a (C, H, W) float tensor in [0, 1].
+
+    If ``target_size=(H, W)`` is given, resize the PIL image to that size
+    BEFORE conversion so the dataloader can collate against same-sized
+    robot images.
+    """
     from PIL import Image as PILImage  # local import to keep import time light
 
     if isinstance(image, torch.Tensor):
         # assume already (C, H, W) in [0, 1]
         return image.float()
     if not isinstance(image, PILImage.Image):
-        # Try to coerce numpy or bytes
         if hasattr(image, "convert"):
             pil = image
         else:
@@ -64,6 +70,9 @@ def _pil_to_tensor(image, channels: int = 3) -> torch.Tensor:
         pil = image
     if pil.mode != "RGB":
         pil = pil.convert("RGB")
+    if target_size is not None:
+        # PIL.resize takes (W, H) order, our target_size is (H, W).
+        pil = pil.resize((target_size[1], target_size[0]), PILImage.BILINEAR)
     import numpy as np
 
     arr = np.array(pil, dtype=np.uint8, copy=True)  # writable copy, (H, W, C)
@@ -101,6 +110,8 @@ class CelebrityIdentificationDataset(Dataset):
         state_dim: int = 32,
         image_camera_key: str = "observation.image",
         task_template: str = "identify the person on {name}",
+        target_image_size: tuple[int, int] | None = None,
+        all_camera_keys: list[str] | None = None,
     ) -> None:
         from datasets import load_dataset  # local import: heavy
 
@@ -111,6 +122,12 @@ class CelebrityIdentificationDataset(Dataset):
         self.action_dim = action_dim
         self.state_dim = state_dim
         self._streaming = streaming
+        # If set to (H, W), every image is resized so the dataloader can
+        # collate against same-sized robot images.
+        self.target_image_size = target_image_size
+        # The full set of camera keys to emit (e.g. multi-camera robot rigs).
+        # If None, only ``image_camera_key`` is emitted.
+        self._all_camera_keys = all_camera_keys
 
         if streaming:
             # Streaming dataset is not indexable; materialise the first
@@ -136,12 +153,14 @@ class CelebrityIdentificationDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         ex = self._items[idx]
-        image_tensor = _pil_to_tensor(ex["image"])
+        image_tensor = _pil_to_tensor(ex["image"], target_size=self.target_image_size)
         name = _name_from_label(self._hf_features, ex.get("label"))
 
         task_str = self.task_template.format(name=name)
         item: dict[str, Any] = {
-            self.image_camera_key: image_tensor,
+            # Emit the same image for every camera key the policy expects, so
+            # batches with multi-camera robot frames still collate correctly.
+            **{k: image_tensor for k in (self._all_camera_keys or [self.image_camera_key])},
             "observation.state": torch.zeros(self.state_dim, dtype=torch.float32),
             "action": torch.zeros(self.chunk_size, self.action_dim, dtype=torch.float32),
             "task": task_str,

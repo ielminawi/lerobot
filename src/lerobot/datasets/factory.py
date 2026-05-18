@@ -142,6 +142,19 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         # that the policy's input_features include.
         cam_keys = list(dataset.meta.camera_keys)
         image_key = cam_keys[0] if cam_keys else "observation.image"
+        # Peek at one robot sample to learn the target image size — celebrity
+        # images must be resized to match, otherwise the default_collate stacks
+        # tensors of different (H, W) and crashes.
+        try:
+            sample_img = dataset[0][image_key]
+            # tensor shape can be (C, H, W) or (T, C, H, W) for delta-timestamp queries.
+            if sample_img.ndim == 4:
+                _, _, H, W = sample_img.shape
+            else:
+                _, H, W = sample_img.shape
+            robot_image_size = (int(H), int(W))
+        except Exception:
+            robot_image_size = None
         celeb_ds = CelebrityIdentificationDataset(
             dataset_name=celeb_name,
             streaming=False,
@@ -149,6 +162,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             action_dim=getattr(cfg.policy, "max_action_dim", 32),
             state_dim=getattr(cfg.policy, "max_state_dim", 32),
             image_camera_key=image_key,
+            target_image_size=robot_image_size,
+            all_camera_keys=cam_keys if cam_keys else None,
         )
         dataset = MixedRobotCelebrityDataset(
             robot_dataset=dataset,
