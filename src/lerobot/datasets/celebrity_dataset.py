@@ -217,6 +217,18 @@ class MixedRobotCelebrityDataset(Dataset):
         # seed is set per-worker; for a single-process test, default seed=0
         # gives reproducible mixing.
         self._rng = random.Random(seed)
+        # Peek at one robot sample to capture every key + tensor shape/dtype.
+        # Celebrity items must backfill any missing keys with zero placeholders
+        # so default_collate doesn't blow up on key mismatch (action_is_pad
+        # etc. are common robot-only fields).
+        self._robot_key_specs: dict[str, tuple] = {}
+        try:
+            probe = robot_dataset[0]
+            for k, v in probe.items():
+                if isinstance(v, torch.Tensor):
+                    self._robot_key_specs[k] = (tuple(v.shape), v.dtype)
+        except Exception:
+            pass
 
     def __len__(self) -> int:
         return len(self.robot_dataset)
@@ -224,8 +236,12 @@ class MixedRobotCelebrityDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         if self._rng.random() < self.celebrity_mix_ratio:
             celeb_idx = self._rng.randrange(len(self.celebrity_dataset))
-            item = self.celebrity_dataset[celeb_idx]
-            # IS_CELEBRITY_ONLY already set by the celebrity dataset.
+            item = dict(self.celebrity_dataset[celeb_idx])
+            # Backfill any robot-only tensor keys with zero placeholders so
+            # default_collate finds the same key set in every batch entry.
+            for k, (shape, dtype) in self._robot_key_specs.items():
+                if k not in item:
+                    item[k] = torch.zeros(*shape, dtype=dtype)
             return item
         item = self.robot_dataset[idx]
         # Inject the flag for robot items so collated batches always have it.
