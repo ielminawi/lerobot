@@ -128,4 +128,32 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
+    # Phase 3: optionally mix in an external celebrity-identification dataset
+    # for text-loss co-training. Opt-in via the policy's celebrity_mix_ratio.
+    mix_ratio = float(getattr(cfg.policy, "celebrity_mix_ratio", 0.0) or 0.0)
+    if mix_ratio > 0.0:
+        from lerobot.datasets.celebrity_dataset import (
+            CelebrityIdentificationDataset,
+            MixedRobotCelebrityDataset,
+        )
+
+        celeb_name = getattr(cfg.policy, "celebrity_dataset_name", "tonyassi/celebrity-1000")
+        # camera_key picks the first camera; mixed batches need an image key
+        # that the policy's input_features include.
+        cam_keys = list(dataset.meta.camera_keys)
+        image_key = cam_keys[0] if cam_keys else "observation.image"
+        celeb_ds = CelebrityIdentificationDataset(
+            dataset_name=celeb_name,
+            streaming=False,
+            chunk_size=getattr(cfg.policy, "chunk_size", 50),
+            action_dim=getattr(cfg.policy, "max_action_dim", 32),
+            state_dim=getattr(cfg.policy, "max_state_dim", 32),
+            image_camera_key=image_key,
+        )
+        dataset = MixedRobotCelebrityDataset(
+            robot_dataset=dataset,
+            celebrity_dataset=celeb_ds,
+            celebrity_mix_ratio=mix_ratio,
+        )
+
     return dataset

@@ -355,7 +355,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if hasattr(cfg.policy, "drop_n_last_frames"):
+    # Phase 3: when celebrity examples are mixed in, EpisodeAwareSampler only
+    # knows about robot indices, so fall back to plain shuffled sampling.
+    mix_ratio = float(getattr(cfg.policy, "celebrity_mix_ratio", 0.0) or 0.0)
+    if hasattr(cfg.policy, "drop_n_last_frames") and mix_ratio == 0.0:
         shuffle = False
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],

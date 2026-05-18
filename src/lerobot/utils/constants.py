@@ -29,6 +29,17 @@ OBS_LANGUAGE_ATTENTION_MASK = OBS_LANGUAGE + ".attention_mask"
 OBS_LANGUAGE_SUBTASK = OBS_STR + ".subtask"
 OBS_LANGUAGE_SUBTASK_TOKENS = OBS_LANGUAGE_SUBTASK + ".tokens"
 OBS_LANGUAGE_SUBTASK_ATTENTION_MASK = OBS_LANGUAGE_SUBTASK + ".attention_mask"
+OBS_ANSWER = OBS_STR + ".answer"
+OBS_ANSWER_TOKENS = OBS_ANSWER + ".tokens"
+OBS_ANSWER_ATTENTION_MASK = OBS_ANSWER + ".attention_mask"
+OBS_ANSWER_LABELS = OBS_ANSWER + ".labels"
+OBS_ID_QUERY = OBS_STR + ".id_query"
+OBS_ID_QUERY_TOKENS = OBS_ID_QUERY + ".tokens"
+OBS_ID_QUERY_ATTENTION_MASK = OBS_ID_QUERY + ".attention_mask"
+
+# Per-sample flag set by the celebrity-identification dataset: True means
+# the sample has no robot action labels and the action loss must be skipped.
+IS_CELEBRITY_ONLY = "is_celebrity_only"
 
 ACTION = "action"
 ACTION_PREFIX = ACTION + "."

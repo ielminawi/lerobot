@@ -71,8 +71,10 @@ class SmolVLMWithExpertModel(nn.Module):
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
+        smolvla_config: "SmolVLAConfig | None" = None,
     ):
         super().__init__()
+        self.smolvla_config = smolvla_config
         if load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
             self.vlm = AutoModelForImageTextToText.from_pretrained(
@@ -84,11 +86,26 @@ class SmolVLMWithExpertModel(nn.Module):
         else:
             config = AutoConfig.from_pretrained(model_id)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
+            # Fresh construction leaves submodules in mismatched dtypes
+            # (text_config.torch_dtype is bfloat16 for embed_tokens but the
+            # lm_head/vision_model are float32). Force a single dtype so the
+            # HF inputs_merger doesn't trip on a Float/BFloat16 index_put.
+            # Loaded weights via from_pretrained(torch_dtype="bfloat16") get
+            # this consistency automatically; we just mirror it.
+            self.vlm = self.vlm.to(dtype=torch.float32)
         self.processor = AutoProcessor.from_pretrained(model_id)
-        if num_vlm_layers > 0:
-            print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
-            self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]
-        self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)
+        # Keep ALL VLM text layers registered on `self.vlm` so the text-loss co-training
+        # path (_compute_text_loss → self.vlm(...)) runs through the full pretrained
+        # depth and `lm_head` sees the representation it was trained for. The action
+        # path manually iterates only the first `self.num_vlm_layers` layers (see the
+        # custom `forward` below); the rest are untouched on the action side.
+        self.num_full_vlm_layers = len(self.get_vlm_model().text_model.layers)
+        self.num_vlm_layers = num_vlm_layers if num_vlm_layers > 0 else self.num_full_vlm_layers
+        if 0 < num_vlm_layers < self.num_full_vlm_layers:
+            print(
+                f"Action path will use the first {self.num_vlm_layers} of "
+                f"{self.num_full_vlm_layers} VLM text layers ..."
+            )
         self.config = config
         # Smaller lm expert
         lm_expert_config = copy.deepcopy(config.text_config)
@@ -97,8 +114,8 @@ class SmolVLMWithExpertModel(nn.Module):
         lm_expert_config.intermediate_size = get_intermediate_size(int(hidden_size * expert_width_multiplier))
         lm_expert_config.num_hidden_layers = self.num_vlm_layers
         if num_expert_layers > 0:
-            assert len(self.get_vlm_model().text_model.layers) % num_expert_layers == 0, (
-                f"Number of layers in the VLM {len(self.get_vlm_model().text_model.layers)} are not multiple of num_expert_layers {num_expert_layers}"
+            assert self.num_vlm_layers % num_expert_layers == 0, (
+                f"Action-path VLM layer count ({self.num_vlm_layers}) is not a multiple of num_expert_layers ({num_expert_layers})"
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
         self.lm_expert = AutoModel.from_config(lm_expert_config)
@@ -162,6 +179,37 @@ class SmolVLMWithExpertModel(nn.Module):
             for name, params in self.vlm.named_parameters():
                 if any(k in name for k in frozen_layers):
                     params.requires_grad = False
+        
+        # Phase 2: Unfreeze lm_head and optionally VLM layers for text loss co-training
+        if self.smolvla_config is not None and self.smolvla_config.text_loss_weight > 0:
+            # Unfreeze lm_head for text loss supervision
+            for name, params in self.vlm.named_parameters():
+                if "lm_head" in name:
+                    params.requires_grad = True
+            
+            # Unfreeze the LAST N layers of the ACTION PATH's tail (layers
+            # `num_vlm_layers - N` ... `num_vlm_layers - 1`), not the full
+            # stack's tail. Why: the action expert reads hidden states from
+            # the action path's last layer. To let text-loss gradient
+            # reshape features the action expert actually consumes, the
+            # unfrozen weights must sit inside the action path's iteration.
+            # The text-loss forward still runs through the full stack and
+            # its gradient passes back through frozen layers
+            # `num_vlm_layers ... num_full_vlm_layers-1` (chain rule) before
+            # hitting these trainable layers.
+            if self.smolvla_config.num_unfrozen_vlm_layers > 0:
+                num_layers = self.smolvla_config.num_unfrozen_vlm_layers
+                for layer_idx in range(
+                    self.num_vlm_layers - num_layers, self.num_vlm_layers
+                ):
+                    # Actual param prefix on SmolVLMForConditionalGeneration is
+                    # `model.text_model.layers.{i}.` — the previous spelling
+                    # `text_model.model.layers.{i}.` matched nothing, so this
+                    # knob was silently a no-op from Phase 2 onward.
+                    for name, params in self.vlm.named_parameters():
+                        if f"model.text_model.layers.{layer_idx}." in name:
+                            params.requires_grad = True
+        
         # To avoid unused params issue with distributed training
         for name, params in self.lm_expert.named_parameters():
             if "lm_head" in name:

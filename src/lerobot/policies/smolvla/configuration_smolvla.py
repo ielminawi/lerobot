@@ -73,6 +73,27 @@ class SmolVLAConfig(PreTrainedConfig):
     train_expert_only: bool = True
     train_state_proj: bool = True
 
+    # Co-training settings (Phase 2)
+    # Default 0.0 keeps vanilla SmolVLA bit-identical. Recommended for celeb
+    # co-training: 0.5 (action and text losses roughly balanced post-warmup).
+    text_loss_weight: float = 0.0
+    # Number of last layers of the ACTION PATH (layers
+    # num_vlm_layers - N .. num_vlm_layers - 1) to unfreeze for text loss.
+    # Recommended when co-training: 4 (gives the VLM real capacity to encode
+    # identity in the features the action expert reads). 0 = none.
+    num_unfrozen_vlm_layers: int = 0
+    id_query_prompt: str = "Who is the person shown in this image?"  # Identification query for text loss.
+    answer_max_length: int = 16  # Maximum length for tokenized answer labels.
+    id_query_max_length: int = 24  # Maximum length for tokenized identification query.
+
+    # Phase 3: external celebrity dataset mixing.
+    # 0.0 disables. Recommended when co-training: 0.5 — half the batch is
+    # celebrity-only identity examples, half is robot demos. With a small
+    # (~300-img) celeb dataset you want this high so the VLM sees enough
+    # identity supervision per epoch.
+    celebrity_mix_ratio: float = 0.0
+    celebrity_dataset_name: str = "ielminawi/celeb30"  # HuggingFace repo id of the celebrity identification dataset.
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -122,6 +143,24 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+
+        # Co-training (Phase 2/3) foot-gun checks.
+        if not 0.0 <= self.celebrity_mix_ratio <= 1.0:
+            raise ValueError(
+                f"celebrity_mix_ratio must be in [0, 1], got {self.celebrity_mix_ratio}"
+            )
+        if self.celebrity_mix_ratio > 0.0 and self.text_loss_weight <= 0.0:
+            raise ValueError(
+                "celebrity_mix_ratio > 0 with text_loss_weight == 0 has no training "
+                "signal: celebrity samples' action loss is masked off and there is no "
+                "text loss either. Set text_loss_weight > 0 or celebrity_mix_ratio = 0."
+            )
+        if self.num_unfrozen_vlm_layers < 0:
+            raise ValueError(
+                f"num_unfrozen_vlm_layers must be >= 0, got {self.num_unfrozen_vlm_layers}"
+            )
+        # Cap is checked at construction-time in SmolVLMWithExpertModel where
+        # we know the actual action-path layer count.
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

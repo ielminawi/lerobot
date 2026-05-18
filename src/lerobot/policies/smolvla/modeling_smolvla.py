@@ -67,7 +67,17 @@ from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
 from lerobot.policies.utils import (
     populate_queues,
 )
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import (
+    ACTION,
+    IS_CELEBRITY_ONLY,
+    OBS_ANSWER_LABELS,
+    OBS_ANSWER_TOKENS,
+    OBS_ID_QUERY_ATTENTION_MASK,
+    OBS_ID_QUERY_TOKENS,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
+)
 from lerobot.utils.device_utils import get_safe_dtype
 
 
@@ -376,7 +386,30 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        
+        # Prepare text loss inputs if available
+        id_query_tokens = batch.get(OBS_ID_QUERY_TOKENS)
+        id_query_masks = batch.get(OBS_ID_QUERY_ATTENTION_MASK)
+        answer_tokens = batch.get(OBS_ANSWER_TOKENS)
+        answer_labels = batch.get(OBS_ANSWER_LABELS)
+        
+        # Forward pass through model
+        model_output = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time,
+            id_query_tokens=id_query_tokens,
+            id_query_masks=id_query_masks,
+            answer_tokens=answer_tokens,
+            answer_labels=answer_labels
+        )
+        
+        # Handle both dict (with text loss) and tensor (backward compatible) returns
+        text_loss = None
+        if isinstance(model_output, dict):
+            losses = model_output['action_loss']
+            text_loss = model_output.get('text_loss')
+        else:
+            losses = model_output
+        
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -390,16 +423,55 @@ class SmolVLAPolicy(PreTrainedPolicy):
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
+        # Phase 3: zero out action loss for celebrity-only samples (no real
+        # actions). We average over the count of *robot* samples so the
+        # per-robot-sample gradient magnitude is preserved.
+        is_celebrity_only = batch.get(IS_CELEBRITY_ONLY)
+        per_sample_loss = losses.mean(dim=(1, 2))  # (B,)
+        batch_size = per_sample_loss.shape[0]
+        if is_celebrity_only is not None:
+            celeb_mask = is_celebrity_only.to(device=per_sample_loss.device, dtype=torch.bool)
+            robot_mask = (~celeb_mask).to(per_sample_loss.dtype)
+            n_robot = robot_mask.sum()
+            per_sample_loss = per_sample_loss * robot_mask
+            if n_robot > 0:
+                action_loss = per_sample_loss.sum() / n_robot
+            else:
+                # All-celebrity batch: no action supervision this step.
+                action_loss = per_sample_loss.sum() * 0.0
+            loss_dict["n_robot_samples"] = int(n_robot.item())
+        else:
+            action_loss = per_sample_loss.mean()
+
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
-            loss_dict["loss"] = per_sample_loss.mean().item()
+            # RA-BC weighting consumes per-sample losses. Mixing it with the
+            # (non-per-sample) text loss requires deciding how to weight a
+            # single scalar against per-sample-weighted action losses — we
+            # don't have that policy yet, so refuse to silently choose one.
+            assert text_loss is None, (
+                "text_loss_weight > 0 is incompatible with reduction='none' "
+                "(RA-BC weighting). Set text_loss_weight=0 to use RA-BC, or "
+                "disable RA-BC to use text loss."
+            )
+            assert is_celebrity_only is None or not bool(is_celebrity_only.any()), (
+                "Celebrity-only samples are incompatible with reduction='none' "
+                "(RA-BC weighting). Disable RA-BC to mix in celebrity examples."
+            )
+            action_loss_scalar = action_loss.item()
+            loss_dict["action_loss"] = action_loss_scalar
+            loss_dict["loss"] = action_loss_scalar
             return per_sample_loss, loss_dict
         else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
-            loss_dict["loss"] = loss.item()
-            return loss, loss_dict
+            loss_dict["action_loss"] = action_loss.item()
+
+            if text_loss is not None:
+                loss_dict["text_loss"] = text_loss.item()
+                total_loss = action_loss + self.config.text_loss_weight * text_loss
+                loss_dict["total_loss"] = total_loss.item()
+                return total_loss, loss_dict
+
+            loss_dict["loss"] = action_loss.item()
+            return action_loss, loss_dict
 
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
@@ -568,6 +640,7 @@ class VLAFlowMatching(nn.Module):
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
+            smolvla_config=self.config,
         )
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
@@ -760,10 +833,71 @@ class VLAFlowMatching(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
 
-    def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+    def _compute_text_loss(
+        self,
+        images: list[Tensor],
+        id_query_tokens: Tensor,
+        answer_tokens: Tensor,
+        answer_labels: Tensor,
     ) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        """Run a second forward pass through the full HF VLM to compute the
+        celebrity-identification CE loss. Uses the same image(s) as the action
+        pass; supervises only the answer-token positions."""
+        vlm = self.vlm_with_expert.vlm
+        vlm_model = vlm.model
+        image_token_id = vlm_model.image_token_id
+        image_seq_len = vlm_model.image_seq_len
+
+        batch_size = id_query_tokens.shape[0]
+        device = id_query_tokens.device
+        id_query_len = id_query_tokens.shape[1]
+        answer_len = answer_labels.shape[1]
+
+        # HF SmolVLM expects pixel_values shape (B, num_images, C, H, W).
+        # Use the first camera image to mirror what the prompt-style VQA call would see.
+        image = images[0]
+        # `embed_prefix` upstream normalizes the image to [-1, 1] before the action
+        # forward. The HF VLM expects pixel_values in the same scale that the image
+        # processor produces; the lerobot `prepare_images` step has already applied
+        # the (img * 2 - 1) normalization, so we pass the image through as-is.
+        pixel_values = image.unsqueeze(1)  # (B, 1, C, H, W)
+        # Cast pixel_values to the vision encoder's dtype to avoid dtype mismatch.
+        pixel_values = pixel_values.to(dtype=vlm_model.vision_model.embeddings.patch_embedding.weight.dtype)
+
+        # input_ids = [<image>]*image_seq_len + id_query + answer
+        image_token_ids = torch.full(
+            (batch_size, image_seq_len), image_token_id, dtype=torch.long, device=device
+        )
+        combined_input_ids = torch.cat([image_token_ids, id_query_tokens, answer_tokens], dim=1)
+
+        # labels: -100 everywhere except answer span (which already has -100 padding from preprocessor)
+        ignore_image = torch.full((batch_size, image_seq_len), -100, dtype=torch.long, device=device)
+        ignore_query = torch.full((batch_size, id_query_len), -100, dtype=torch.long, device=device)
+        combined_labels = torch.cat([ignore_image, ignore_query, answer_labels], dim=1)
+
+        combined_attention_mask = torch.ones(
+            (batch_size, combined_input_ids.shape[1]), dtype=torch.long, device=device
+        )
+
+        vlm_outputs = vlm(
+            input_ids=combined_input_ids,
+            attention_mask=combined_attention_mask,
+            pixel_values=pixel_values,
+            labels=combined_labels,
+            return_dict=True,
+        )
+        return vlm_outputs.loss
+
+    def forward(
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None,
+        id_query_tokens=None, id_query_masks=None, answer_tokens=None, answer_labels=None
+    ) -> dict | Tensor:
+        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)
+        
+        Returns:
+            dict with 'action_loss' and optionally 'text_loss' if text_loss_weight > 0
+            Otherwise returns just the action losses tensor for backward compatibility
+        """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -795,8 +929,22 @@ class VLAFlowMatching(nn.Module):
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
-        losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+        action_losses = F.mse_loss(u_t, v_t, reduction="none")
+
+        # Phase 2: text-loss co-training. We do a second forward pass through the
+        # full HF VLM, with the same image as the action pass plus an id-query and
+        # the celebrity-name answer, supervising only the answer tokens with CE.
+        if self.config.text_loss_weight > 0 and id_query_tokens is not None and answer_labels is not None:
+            text_loss = self._compute_text_loss(
+                images=images,
+                id_query_tokens=id_query_tokens,
+                answer_tokens=answer_tokens,
+                answer_labels=answer_labels,
+            )
+            return {"action_loss": action_losses, "text_loss": text_loss}
+
+        # Backward compatibility: return tensor if no text loss
+        return action_losses
 
     def sample_actions(
         self,
