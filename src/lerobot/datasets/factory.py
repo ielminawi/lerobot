@@ -154,31 +154,26 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             _, H, W = sample_img.shape
         robot_image_size = (int(H), int(W))
 
-        # Action shape: typically (chunk_size, action_dim). Use whatever the
-        # robot dataset emits raw — the model pads to max_action_dim internally.
+        # Use exact tensor shapes from a real robot sample. default_collate
+        # demands every batch entry share the same shape.
         sample_action = sample.get("action")
-        if sample_action is not None and sample_action.ndim == 2:
-            chunk_size, action_dim = sample_action.shape
-        else:
-            chunk_size = getattr(cfg.policy, "chunk_size", 50)
-            action_dim = getattr(cfg.policy, "max_action_dim", 32)
-
-        # State shape: (state_dim,) — also pulled from the actual sample.
+        action_shape = tuple(sample_action.shape) if sample_action is not None else (
+            getattr(cfg.policy, "chunk_size", 50),
+            getattr(cfg.policy, "max_action_dim", 32),
+        )
         sample_state = sample.get("observation.state")
-        if sample_state is not None and sample_state.ndim == 1:
-            state_dim = int(sample_state.shape[0])
-        else:
-            state_dim = getattr(cfg.policy, "max_state_dim", 32)
+        state_shape = tuple(sample_state.shape) if sample_state is not None else (
+            getattr(cfg.policy, "max_state_dim", 32),
+        )
 
         celeb_ds = CelebrityIdentificationDataset(
             dataset_name=celeb_name,
             streaming=False,
-            chunk_size=int(chunk_size),
-            action_dim=int(action_dim),
-            state_dim=int(state_dim),
             image_camera_key=image_key,
             target_image_size=robot_image_size,
             all_camera_keys=cam_keys if cam_keys else None,
+            state_shape=state_shape,
+            action_shape=action_shape,
         )
         dataset = MixedRobotCelebrityDataset(
             robot_dataset=dataset,

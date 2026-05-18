@@ -112,6 +112,8 @@ class CelebrityIdentificationDataset(Dataset):
         task_template: str = "identify the person on {name}",
         target_image_size: tuple[int, int] | None = None,
         all_camera_keys: list[str] | None = None,
+        state_shape: tuple[int, ...] | None = None,
+        action_shape: tuple[int, ...] | None = None,
     ) -> None:
         from datasets import load_dataset  # local import: heavy
 
@@ -128,6 +130,12 @@ class CelebrityIdentificationDataset(Dataset):
         # The full set of camera keys to emit (e.g. multi-camera robot rigs).
         # If None, only ``image_camera_key`` is emitted.
         self._all_camera_keys = all_camera_keys
+        # Exact tensor shapes for state/action placeholders. If None, fall
+        # back to 1D state (state_dim,) / 2D action (chunk_size, action_dim).
+        # Robot datasets that use delta_indices return higher-dim states
+        # (e.g. (1, state_dim)) and the placeholder must match exactly.
+        self._state_shape: tuple[int, ...] = state_shape if state_shape is not None else (state_dim,)
+        self._action_shape: tuple[int, ...] = action_shape if action_shape is not None else (chunk_size, action_dim)
 
         if streaming:
             # Streaming dataset is not indexable; materialise the first
@@ -161,8 +169,8 @@ class CelebrityIdentificationDataset(Dataset):
             # Emit the same image for every camera key the policy expects, so
             # batches with multi-camera robot frames still collate correctly.
             **{k: image_tensor for k in (self._all_camera_keys or [self.image_camera_key])},
-            "observation.state": torch.zeros(self.state_dim, dtype=torch.float32),
-            "action": torch.zeros(self.chunk_size, self.action_dim, dtype=torch.float32),
+            "observation.state": torch.zeros(*self._state_shape, dtype=torch.float32),
+            "action": torch.zeros(*self._action_shape, dtype=torch.float32),
             "task": task_str,
             IS_CELEBRITY_ONLY: torch.tensor(True, dtype=torch.bool),
             # Compatibility placeholders that LeRobotDataset items carry.
