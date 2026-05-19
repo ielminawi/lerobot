@@ -58,39 +58,72 @@ def main():
     policy = SmolVLAPolicy.from_pretrained(args.policy_path)
     policy.to(args.device).eval()
 
-    # Pull out the inner HF VLM + its processor.
     vlm = policy.model.vlm_with_expert.vlm
     processor = policy.model.vlm_with_expert.processor
+    tokenizer = processor.tokenizer
+    vlm_model = vlm.model
+    image_token_id = vlm_model.image_token_id
+    image_seq_len = vlm_model.image_seq_len
 
     print(f"Loading image: {args.image}")
     img = load_image(args.image)
 
-    # Build the standard SmolVLM2 chat template prompt.
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": args.prompt},
-            ],
-        }
-    ]
-    prompt_str = processor.apply_chat_template(messages, add_generation_prompt=True)
-    print(f"Prompt: {prompt_str!r}")
+    # MATCH TRAINING FORMAT exactly.
+    # During training (_compute_text_loss):
+    #   input_ids = [<image>]*image_seq_len + id_query_tokens + answer_tokens
+    #   labels    = -100 on image + id_query, real labels on answer
+    #   pixel_values: (B, 1, C, H, W) in [-1, 1] (lerobot prepare_images normalization)
+    #
+    # At inference we feed everything up to the answer and let `generate` produce
+    # the answer tokens autoregressively.
 
-    inputs = processor(text=prompt_str, images=[img], return_tensors="pt")
-    inputs = {k: (v.to(args.device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
+    import torch.nn.functional as F
+    import numpy as np
+
+    # Image: resize to 512x512 with padding (matches lerobot's resize_imgs_with_padding),
+    # normalize to [-1, 1].
+    img_arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0  # (H, W, C) in [0, 1]
+    img_t = torch.from_numpy(img_arr).permute(2, 0, 1).unsqueeze(0)   # (1, C, H, W)
+    img_t = F.interpolate(img_t, size=(512, 512), mode="bilinear", align_corners=False)
+    img_t = img_t * 2.0 - 1.0                                          # [-1, 1]
+    pixel_values = img_t.unsqueeze(1).to(args.device,
+        dtype=vlm_model.vision_model.embeddings.patch_embedding.weight.dtype)
+
+    # Tokenize the id-query prompt exactly as IdQueryTokenizerProcessorStep did.
+    id_query_max_length = 24  # default in config; override with --id-query-max-length if changed
+    q = tokenizer(
+        args.prompt,
+        max_length=id_query_max_length,
+        padding="max_length",
+        padding_side="right",
+        truncation=True,
+        return_tensors="pt",
+    )
+    id_query_tokens = q["input_ids"].to(args.device)
+    id_query_mask = q["attention_mask"].to(args.device)
+
+    # Build the full input: [<image>]*image_seq_len + id_query_tokens
+    batch_size = 1
+    image_tokens = torch.full((batch_size, image_seq_len), image_token_id,
+                              dtype=torch.long, device=args.device)
+    input_ids = torch.cat([image_tokens, id_query_tokens], dim=1)
+    attention_mask = torch.cat([
+        torch.ones((batch_size, image_seq_len), dtype=torch.long, device=args.device),
+        id_query_mask.long(),
+    ], dim=1)
 
     print("Generating ...")
     with torch.no_grad():
         out_ids = vlm.generate(
-            **inputs,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
             max_new_tokens=args.max_new_tokens,
             do_sample=False,
         )
 
-    new_tokens = out_ids[0, inputs["input_ids"].shape[1]:]
-    answer = processor.batch_decode([new_tokens], skip_special_tokens=True)[0]
+    new_tokens = out_ids[0, input_ids.shape[1]:]
+    answer = tokenizer.decode(new_tokens, skip_special_tokens=True)
     print(f"\n>>> VLM says: {answer.strip()!r}")
 
 
