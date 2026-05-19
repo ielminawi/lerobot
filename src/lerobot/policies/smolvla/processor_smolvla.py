@@ -269,6 +269,7 @@ class IdQueryTokenizerProcessorStep(TokenizerProcessorStep):
         padding_side: str = "right",
         padding: str = "max_length",
         truncation: bool = True,
+        task_key: str = "dummy_not_used",  # accepted but always ignored — we tokenize a fixed prompt, not a per-sample task
     ):
         self.id_query_prompt = id_query_prompt
         super().__init__(
@@ -278,7 +279,7 @@ class IdQueryTokenizerProcessorStep(TokenizerProcessorStep):
             padding_side=padding_side,
             padding=padding,
             truncation=truncation,
-            task_key="dummy_not_used",
+            task_key=task_key,
         )
 
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
