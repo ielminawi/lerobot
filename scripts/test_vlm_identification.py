@@ -107,12 +107,29 @@ def main():
     image_tokens = torch.full((batch_size, image_seq_len), image_token_id,
                               dtype=torch.long, device=args.device)
     input_ids = torch.cat([image_tokens, id_query_tokens], dim=1)
-    attention_mask = torch.cat([
-        torch.ones((batch_size, image_seq_len), dtype=torch.long, device=args.device),
-        id_query_mask.long(),
-    ], dim=1)
+    # MATCH TRAINING: attention_mask is all 1s in _compute_text_loss (including pad).
+    attention_mask = torch.ones(input_ids.shape, dtype=torch.long, device=args.device)
 
-    print("Generating ...")
+    print(f"id_query_tokens decoded: {tokenizer.decode(id_query_tokens[0], skip_special_tokens=False)!r}")
+    print(f"input_ids shape: {tuple(input_ids.shape)}, pixel_values shape: {tuple(pixel_values.shape)}")
+
+    # First, do a single forward pass and look at the top-k logits at the answer
+    # boundary — this tells us what the model wants to predict for token 0.
+    print("Forward pass to inspect first-token logits ...")
+    with torch.no_grad():
+        out = vlm(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            return_dict=True,
+        )
+    last_logits = out.logits[0, -1]  # logits at the LAST position of the prefix
+    topk = torch.topk(last_logits, k=10)
+    print("Top-10 token predictions for first answer position:")
+    for prob_logit, tok_id in zip(topk.values.tolist(), topk.indices.tolist()):
+        print(f"  id={tok_id:6d}  logit={prob_logit:8.3f}  token={tokenizer.decode([tok_id])!r}")
+
+    print("\nGenerating (greedy, max_new_tokens={}) ...".format(args.max_new_tokens))
     with torch.no_grad():
         out_ids = vlm.generate(
             input_ids=input_ids,
@@ -125,6 +142,7 @@ def main():
     new_tokens = out_ids[0, input_ids.shape[1]:]
     answer = tokenizer.decode(new_tokens, skip_special_tokens=True)
     print(f"\n>>> VLM says: {answer.strip()!r}")
+    print(f">>> raw token ids: {new_tokens.tolist()}")
 
 
 if __name__ == "__main__":
